@@ -1,0 +1,8 @@
+pip install geopandas shapely pyproj streamlit pandas
+
+
+C:\Users\duranto\OneDrive - The Dairy Farm Company Ltd\UK Data
+
+streamlit run app.py
+
+
