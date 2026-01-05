@@ -16,12 +16,15 @@ st.set_page_config(page_title="UK GP → LSOA Classification Viewer", layout="wi
 # --------------------------
 # AUTH
 # --------------------------
-USERS = st.secrets.get("users", {})  # {"username": "<sha256hex>"}
+
+USERS = st.secrets.get("users", {})
 
 def verify(username: str, password: str) -> bool:
+    # Simple raw password comparison
     if username not in USERS:
         return False
-    return USERS[username] == sha256(password.encode("utf-8")).hexdigest()
+    return USERS[username] == password
+
 
 def login_gate():
     if "logged_in" in st.session_state and st.session_state["logged_in"]:
