@@ -1,52 +1,62 @@
-import os
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
 
 # app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import pydeck as pdk
-from hashlib import sha256
 from typing import Dict, List
 from pyproj import Transformer
 
+# -----------------------------------------------------------------------------
+# Page & Auth
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="UK GP → LSOA Classification Viewer", layout="wide")
 
-# --------------------------
-# AUTH
-# --------------------------
-
-USERS = st.secrets.get("users", {})
+# Raw passwords stored in Streamlit Secrets, e.g.:
+# [users]
+# duran = "duran"
+# carl = "carl"
+# bobby = "bobby"
+USERS = st.secrets.get("users", {})  # dict: {username: password}
 
 def verify(username: str, password: str) -> bool:
-    # Simple raw password comparison
-    if username not in USERS:
-        return False
-    return USERS[username] == password
-
+    """Simple raw password comparison (development setup)."""
+    return username in USERS and USERS[username] == password
 
 def login_gate():
-    if "logged_in" in st.session_state and st.session_state["logged_in"]:
-        return True
+    """Render a login screen and stop execution until authenticated."""
+    if st.session_state.get("logged_in"):
+        return  # Already authenticated; proceed to the app
+
     st.title("Login")
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
+
     if st.button("Sign in"):
         if verify(u, p):
             st.session_state["logged_in"] = True
             st.session_state["user"] = u
             st.success("Authenticated. Loading app...")
+            # Use the stable API (replaces deprecated st.experimental_rerun)
             st.rerun()
         else:
             st.error("Invalid credentials")
+
+    # Halt the rest of the script until user logs in
     st.stop()
 
+# Gate the app immediately
 login_gate()
 
-# --------------------------
-# DATA LOADERS (cached)
-# --------------------------
+# Optional logout button
+with st.sidebar:
+    if st.button("Logout"):
+        st.session_state.clear()
+        st.rerun()
+
+# -----------------------------------------------------------------------------
+# Data loaders (cached)
+# -----------------------------------------------------------------------------
 DATA_DIR = "data"
 
 @st.cache_data(show_spinner=False)
@@ -54,7 +64,6 @@ def load_gp():
     # GP.csv: GP Code, GP Name, Patients, Ward code, Ward Name, LA Code, LA Name
     df = pd.read_csv(f"{DATA_DIR}/GP.csv")
     df.columns = [c.strip() for c in df.columns]
-    # Normalize keys
     df["GP Code"] = df["GP Code"].astype(str).str.strip().str.upper()
     df["GP Name"] = df["GP Name"].astype(str).str.strip()
     return df
@@ -64,14 +73,18 @@ def load_gp_lsoa():
     # GP_LSOA.csv: Rank link, GP, LSOA, Patients, % total, Rank, M, F
     df = pd.read_csv(f"{DATA_DIR}/GP_LSOA.csv")
     df.columns = [c.strip() for c in df.columns]
-    df["GP"] = df["GP"].astype(str).str.strip().str.upper()      # GP Code as per your sample (e.g., A81001)
-    df["LSOA"] = df["LSOA"].astype(str).str.strip().str.upper()  # E010... codes
-    df["Patients"] = pd.to_numeric(df["Patients"], errors="coerce").fillna(0)
+    # Normalize keys and numeric fields
+    if "GP" in df.columns:
+        df["GP"] = df["GP"].astype(str).str.strip().str.upper()
+    if "LSOA" in df.columns:
+        df["LSOA"] = df["LSOA"].astype(str).str.strip().str.upper()
+    if "Patients" in df.columns:
+        df["Patients"] = pd.to_numeric(df["Patients"], errors="coerce").fillna(0)
     return df
 
 @st.cache_data(show_spinner=False)
 def load_classification():
-    # LSOA_Classification.csv: many Pop*/HH* columns + LSOA
+    # LSOA_Classification.csv: includes LSOA and many Pop*/HH* columns
     df = pd.read_csv(f"{DATA_DIR}/LSOA_Classification.csv")
     df.columns = [c.strip() for c in df.columns]
     if "LSOA" not in df.columns:
@@ -81,23 +94,24 @@ def load_classification():
 
 @st.cache_data(show_spinner=False)
 def load_centroids():
-    # LSOA_PopCentroids_EW_2021_V4.csv: FID, LSOA21CD, x, y (plus others)
+    """
+    LSOA_PopCentroids_EW_2021_V4.csv: columns include LSOA21CD, x, y
+    - If x,y look like lon/lat, keep as-is
+    - Otherwise assume British National Grid (EPSG:27700) and convert to WGS84 (EPSG:4326)
+    """
     df = pd.read_csv(f"{DATA_DIR}/LSOA_PopCentroids_EW_2021_V4.csv")
     df.columns = [c.strip() for c in df.columns]
     for required in ["LSOA21CD", "x", "y"]:
         if required not in df.columns:
             raise ValueError("Centroid CSV must have columns: LSOA21CD, x, y")
     df["LSOA21CD"] = df["LSOA21CD"].astype(str).str.strip().str.upper()
+    x = pd.to_numeric(df["x"], errors="coerce")
+    y = pd.to_numeric(df["y"], errors="coerce")
 
-    # Auto-detect CRS for (x,y):
-    # If values look like lon/lat (roughly -10..10 for lon & 49..60 for lat), skip conversion.
-    # Otherwise assume British National Grid (EPSG:27700) and convert to WGS84 (EPSG:4326).
-    x = df["x"].astype(float)
-    y = df["y"].astype(float)
-
+    # Heuristic to detect lon/lat vs BNG
     looks_like_lonlat = (
-        x.between(-10, 10).mean() > 0.90 and  # most x in lon range
-        y.between(49, 60).mean() > 0.90       # most y in lat range
+        x.between(-10, 10).mean() > 0.90 and
+        y.between(49, 60).mean() > 0.90
     )
 
     if looks_like_lonlat:
@@ -116,35 +130,34 @@ gp_lsoa = load_gp_lsoa()
 lsoa_cls = load_classification()
 centroids = load_centroids()
 
-# --------------------------
-# CLASSIFICATION GROUPING
-# --------------------------
+# -----------------------------------------------------------------------------
+# Classification grouping (Major / Sub / Micro)
+# -----------------------------------------------------------------------------
 def find_columns_by_prefix(df: pd.DataFrame, prefix: str) -> List[str]:
     return [c for c in df.columns if c.startswith(prefix)]
 
 def classification_groups(df: pd.DataFrame, base: str, granularity: str) -> Dict[str, List[str]]:
     """
-    Build groups from classification columns in df for base ('Pop' or 'HH'):
+    Build groups from classification columns for base ('Pop' or 'HH'):
       - Major: base + digits (Pop1..Pop8)
       - Sub:   base + digit + letter (Pop1a..Pop8c), summing any micro columns under it
       - Micro: base + digit + letter + digits (Pop1a1..)
     Returns {group_name: [columns to sum]}
     """
     cols = find_columns_by_prefix(df, base)
-    tokens = [c[len(base):] for c in cols]  # parts after 'Pop' or 'HH'
+    tokens = [c[len(base):] for c in cols]  # suffix after 'Pop' or 'HH'
 
     majors = sorted({t for t in tokens if t.isdigit()})
     subs   = sorted({t for t in tokens if len(t) >= 2 and t[0].isdigit() and t[1].isalpha() and not t[1:].isdigit()})
     micros = sorted({t for t in tokens if len(t) >= 3 and t[0].isdigit() and t[1].isalpha() and t[2:].isdigit()})
 
-    groups = {}
+    groups: Dict[str, List[str]] = {}
 
     if granularity == "Major" and majors:
         for m in majors:
             col = f"{base}{m}"
             if col in cols:
                 groups[col] = [col]
-
     elif granularity == "Sub" and subs:
         for s in subs:
             cands = [f"{base}{s}"] if f"{base}{s}" in cols else []
@@ -152,14 +165,13 @@ def classification_groups(df: pd.DataFrame, base: str, granularity: str) -> Dict
             cands = [c for c in cands if c in cols]
             if cands:
                 groups[f"{base}{s}"] = cands
-
     else:  # Micro
         if micros:
             for mi in micros:
                 col = f"{base}{mi}"
                 if col in cols:
                     groups[col] = [col]
-        elif majors:  # fallback
+        elif majors:  # Fallback to major
             for m in majors:
                 col = f"{base}{m}"
                 if col in cols:
@@ -167,12 +179,11 @@ def classification_groups(df: pd.DataFrame, base: str, granularity: str) -> Dict
 
     return groups
 
-# --------------------------
-# SIDEBAR CONTROLS (defaults)
-# --------------------------
+# -----------------------------------------------------------------------------
+# Sidebar controls (defaults: Population + Major)
+# -----------------------------------------------------------------------------
 st.sidebar.header("Controls")
 
-# Default: Population + Major
 weighting = st.sidebar.radio("Weighting method", ["Population (Pop*)", "Households (HH*)"], index=0)
 base = "Pop" if "Population" in weighting else "HH"
 
@@ -186,35 +197,32 @@ if not groups:
 # GP search
 st.sidebar.write("---")
 st.sidebar.caption("Search GP by name")
-query = st.sidebar.text_input("Type GP name (e.g., 'A81001' or 'Practice Name')")
+query = st.sidebar.text_input("Type GP name (or code, e.g., 'A81001')")
 matches = gp[gp["GP Name"].str.contains(query, case=False, na=False)].sort_values("GP Name")
 
 if matches.empty and query:
     st.sidebar.warning("No GP name matches. Try another term.")
 
-selected_gp_name = st.sidebar.selectbox(
-    "Select a GP",
-    options=(matches["GP Name"] if not matches.empty else gp["GP Name"])
-)
+selected_gp_name = st.sidebar.selectbox("Select a GP", options=(matches["GP Name"] if not matches.empty else gp["GP Name"]))
 selected_row = gp[gp["GP Name"] == selected_gp_name].iloc[0]
 selected_gp_code = selected_row["GP Code"]
 
-# --------------------------
-# FILTER GP_LSOA USING GP CODE (your sample shows GP is code like 'A81001')
-# --------------------------
+# -----------------------------------------------------------------------------
+# Filter GP_LSOA using GP code (your sample shows GP is like 'A81001')
+# -----------------------------------------------------------------------------
 gpl = gp_lsoa[gp_lsoa["GP"] == selected_gp_code].copy()
 
 if gpl.empty:
-    # Try fallbacks: GP name match
+    # Fallback: try matching by name substring
     gpl = gp_lsoa[gp_lsoa["GP"].str.contains(selected_gp_name, case=False, na=False)].copy()
 
 if gpl.empty:
     st.error("No LSOA rows found for this GP in GP_LSOA.csv. Check if 'GP' holds the GP Code or Name.")
     st.stop()
 
-# --------------------------
-# BUILD CLASSIFICATION COUNTS (per LSOA)
-# --------------------------
+# -----------------------------------------------------------------------------
+# Build classification counts by LSOA & estimate patients per classification
+# -----------------------------------------------------------------------------
 # Sum selected group columns for each LSOA
 records = []
 for grp_name, cols in groups.items():
@@ -236,19 +244,19 @@ dist = cls_tidy.merge(denom, on="LSOA", how="left")
 dist = dist[dist["denom"] > 0].copy()
 dist["prop"] = dist["count"] / dist["denom"]
 
-# Merge patients by LSOA
+# Merge GP patients by LSOA
 gpl_pat = gpl[["LSOA", "Patients"]].copy()
 dist = dist.merge(gpl_pat, on="LSOA", how="inner")
 
 # Estimated patients per classification
 dist["est_patients"] = dist["Patients"] * dist["prop"]
 
-# Top 5
+# Top 5 classifications
 top_df = dist.groupby("classification")["est_patients"].sum().sort_values(ascending=False).reset_index()
 top5 = top_df.head(5)
 top5_names = set(top5["classification"])
 
-# Per-LSOA contributions for top 5
+# Per-LSOA contributions for Top 5
 per_lsoa_top5 = (
     dist[dist["classification"].isin(top5_names)]
     .groupby(["classification", "LSOA"])["est_patients"]
@@ -256,9 +264,9 @@ per_lsoa_top5 = (
     .reset_index()
 )
 
-# --------------------------
-# UI
-# --------------------------
+# -----------------------------------------------------------------------------
+# Layout
+# -----------------------------------------------------------------------------
 st.title("GP → LSOA Classification Viewer (UK)")
 st.caption(f"Signed in as **{st.session_state.get('user', 'user')}**")
 st.write(f"**Selected GP:** {selected_gp_name}  |  **GP Code:** {selected_gp_code}")
@@ -271,7 +279,6 @@ with c1:
         top5.rename(columns={"classification": "Classification", "est_patients": "Estimated patients"}),
         use_container_width=True
     )
-    # Optional bar chart
     st.bar_chart(top5.set_index("classification")["est_patients"])
 
 with c2:
@@ -279,8 +286,8 @@ with c2:
     st.markdown(
         f"""
 - Weighting method: **{weighting}**  
-- Granularity: **{granularity}** (columns starting with **{base}**)
-- Estimation: GP's LSOA patient counts apportioned by LSOA’s {('population' if base=='Pop' else 'household')} distribution across selected classifications.
+- Granularity: **{granularity}** (columns starting with **{base}**)  
+- Estimation: GP's LSOA patient counts apportioned by LSOA’s {('population' if base=='Pop' else 'household')} distribution across selected classifications.  
 - This is an estimator (no patient-level classification).
         """
     )
@@ -292,22 +299,24 @@ st.dataframe(
     use_container_width=True
 )
 
-# --------------------------
-# MAP (pydeck + centroids)
-# --------------------------
+# -----------------------------------------------------------------------------
+# Map (pydeck + centroids)
+# -----------------------------------------------------------------------------
 st.subheader("Map: LSOAs contributing to Top 5 classifications")
 
 # Total by LSOA for Top 5
 lsoa_tot = per_lsoa_top5.groupby("LSOA")["est_patients"].sum().reset_index()
 
-# Join centroids (your file uses LSOA21CD)
+# Join centroids
 map_df = lsoa_tot.merge(centroids, on="LSOA", how="left").dropna(subset=["lat", "lon"])
 if map_df.empty:
     st.warning("No centroid matches. Ensure LSOA codes align between files.")
 else:
-    # Scale radius (meters) — adjust for visual clarity
+    # Scale radius (meters)
     max_val = map_df["est_patients"].max()
-    map_df["radius"] = (map_df["est_patients"] / max_val) * 5000 + 500
+    # Avoid division by zero
+    scale = 5000 if max_val > 0 else 500
+    map_df["radius"] = (map_df["est_patients"] / max_val) * scale + 500 if max_val > 0 else 500
 
     tooltip_html = """
     <b>LSOA:</b> {LSOA} <br/>
@@ -323,7 +332,7 @@ else:
         pickable=True,
     )
 
-    view = pdk.ViewState(latitude=54, longitude=-2, zoom=5)  # UK
+    view = pdk.ViewState(latitude=54, longitude=-2, zoom=5)  # UK view
     st.pydeck_chart(
         pdk.Deck(
             layers=[layer],
