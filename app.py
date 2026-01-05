@@ -37,7 +37,7 @@ def login_gate():
             st.session_state["logged_in"] = True
             st.session_state["user"] = u
             st.success("Authenticated. Loading app...")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Invalid credentials")
     st.stop()
